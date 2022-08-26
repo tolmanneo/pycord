@@ -683,6 +683,36 @@ class VoiceClient(VoiceProtocol):
 
         self.decoder.decode(data)
 
+    def unpack_audio_stream(self, data):
+        """Takes an audio packet received from Discord and decodes it into pcm audio data.
+        If there are no users talking in the channel, `None` will be returned.
+
+        You must be connected to receive audio.
+
+        .. versionadded:: 2.0
+
+        Parameters
+        ---------
+        data: :class:`bytes`
+            Bytes received by Discord via the UDP connection used for sending and receiving voice data.
+        """
+        if 200 <= data[1] <= 204:
+            # RTCP received.
+            # RTCP provides information about the connection
+            # as opposed to actual audio data, so it's not
+            # important at the moment.
+            return -1
+        if self.paused:
+            return -1
+
+        data = RawData(data, self)
+
+        if data.decrypted_data == b"\xf8\xff\xfe":  # Frame of silence
+            return 0
+
+        self.decoder.decode(data)
+        return 1
+
     def start_recording(self, sink, callback, *args):
         """The bot will begin recording audio from the current voice channel it is in.
         This function uses a thread so the current code line will not be stopped.
@@ -734,6 +764,58 @@ class VoiceClient(VoiceProtocol):
         )
         t.start()
 
+    def start_recording_stream(self, sink, callback, *args):
+        """The bot will begin recording audio from the current voice channel it is in.
+        This function uses a thread so the current code line will not be stopped.
+        Must be in a voice channel to use.
+        Must not be already recording.
+
+        .. versionadded:: 2.0
+
+        Parameters
+        ----------
+        sink: :class:`.Sink`
+            A Sink which will "store" all the audio data.
+        callback: :ref:`coroutine <coroutine>`
+            A function which is called after the bot has stopped recording.
+        *args:
+            Args which will be passed to the callback function.
+
+        Raises
+        ------
+        RecordingException
+            Not connected to a voice channel.
+        RecordingException
+            Already recording.
+        RecordingException
+            Must provide a Sink object.
+        """
+        self.is_silence = False
+        if not self.is_connected():
+            raise RecordingException("Not connected to voice channel.")
+        if self.recording:
+            raise RecordingException("Already recording.")
+        if not isinstance(sink, Sink):
+            raise RecordingException("Must provide a Sink object.")
+
+        self.empty_socket()
+
+        self.decoder = opus.DecodeManager(self)
+        self.decoder.start()
+        self.recording = True
+        self.sink = sink
+        sink.init(self)
+
+        t = threading.Thread(
+            target=self.recv_audio_stream,
+            args=(
+                sink,
+                callback,
+                *args,
+            ),
+        )
+        t.start()
+
     def stop_recording(self):
         """Stops the recording.
         Must be already recording.
@@ -750,6 +832,7 @@ class VoiceClient(VoiceProtocol):
         self.decoder.stop()
         self.recording = False
         self.paused = False
+        self.is_silence = False
 
     def toggle_pause(self):
         """Pauses or unpauses the recording.
@@ -795,7 +878,49 @@ class VoiceClient(VoiceProtocol):
                 continue
 
             self.unpack_audio(data)
+        print('user timestamps:', self.user_timestamps)
+        self.stopping_time = time.perf_counter()
+        self.sink.cleanup()
+        callback = asyncio.run_coroutine_threadsafe(callback(self.sink, *args), self.loop)
+        result = callback.result()
 
+        if result is not None:
+            print(result)
+
+    def recv_audio_stream(self, sink, callback, *args):
+        # Gets data from _recv_audio and sorts
+        # it by user, handles pcm files and
+        # silence that should be added.
+
+        self.user_timestamps = {}
+        self.starting_time = time.perf_counter()
+        silence_cap = 10
+        weight = {0: 1, -1: 5}
+        silence_count = 0
+        while self.recording:
+            ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
+            if not ready:
+                if err:
+                    print(f"Socket error: {err}")
+                continue
+
+            try:
+                data = self.socket.recv(4096)
+            except OSError:
+                self.stop_recording()
+                continue
+
+            is_not_silence = self.unpack_audio_stream(data)
+            print(is_not_silence, end=" ")
+            if is_not_silence == 1:
+                silence_count = 0
+            else:
+                silence_count += weight[is_not_silence]
+            if silence_count >= silence_cap:
+                print('silence switch to True')
+                self.is_silence = True
+
+        print('user timestamps:', self.user_timestamps)
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
         callback = asyncio.run_coroutine_threadsafe(callback(self.sink, *args), self.loop)
